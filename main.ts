@@ -20,6 +20,12 @@ class MyStack extends TerraformStack {
     new Vpc(this, 'vpc', {
       cidrBlock: '10.0.0.0/16'
     });
+
+    // This is the S3 bucket where the Glue job script and resources will live
+    new S3Bucket(this, 'glue-bucket', {
+      bucket: 'glue-bucket',
+      acl: 'private'
+    });
   }
 }
 
