@@ -14,6 +14,7 @@ import { SecretsmanagerSecretVersion } from '@cdktf/provider-aws/lib/secretsmana
 import { RandomProvider } from '@cdktf/provider-random/lib/provider';
 import { Subnet } from '@cdktf/provider-aws/lib/subnet';
 import { DbSubnetGroup } from '@cdktf/provider-aws/lib/db-subnet-group';
+import { s3BucketPublicAccessBlock } from '@cdktf/provider-aws';
 
 class MyStack extends TerraformStack {
   readonly vpc: Vpc;
@@ -50,9 +51,16 @@ class MyStack extends TerraformStack {
     });
 
     // This is the S3 bucket where the Glue job script and resources will live
-    new S3Bucket(this, 'glue-bucket', {
-      bucket: 'glue-bucket',
-      acl: 'private'
+    const glueScriptsBucket = new S3Bucket(this, 'glue-bucket', {
+      bucket: 'gluescripts.akasper.codecentric.de'
+    });
+    // Block public access
+    new s3BucketPublicAccessBlock.S3BucketPublicAccessBlock(this, 'glue-bucket-public-access-block', {
+      bucket: glueScriptsBucket.bucket,
+      blockPublicAcls: true,
+      blockPublicPolicy: true,
+      ignorePublicAcls: true,
+      restrictPublicBuckets: true
     });
 
     // This is the security group the Glue job will use to access the RDS database
