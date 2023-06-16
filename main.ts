@@ -12,6 +12,8 @@ import { Password } from '@cdktf/provider-random/lib/password';
 import { SecretsmanagerSecret } from '@cdktf/provider-aws/lib/secretsmanager-secret';
 import { SecretsmanagerSecretVersion } from '@cdktf/provider-aws/lib/secretsmanager-secret-version';
 import { RandomProvider } from '@cdktf/provider-random/lib/provider';
+import { Subnet } from '@cdktf/provider-aws/lib/subnet';
+import { DbSubnetGroup } from '@cdktf/provider-aws/lib/db-subnet-group';
 
 class MyStack extends TerraformStack {
   readonly vpc: Vpc;
@@ -28,7 +30,23 @@ class MyStack extends TerraformStack {
 
     // This is the VPC we want to deploy our resources into
     this.vpc = new Vpc(this, 'vpc', {
-      cidrBlock: '10.0.0.0/16'
+      cidrBlock: '10.0.0.0/16',
+      enableDnsHostnames: true,
+      enableDnsSupport: true
+    });
+
+    // Create isolated subnets for the RDS database
+    const rdsSubnetA = new Subnet(this, 'rds-subnet-a', {
+      vpcId: this.vpc.id,
+      cidrBlock: '10.0.1.0/24',
+      availabilityZone: 'eu-central-1a',
+      mapPublicIpOnLaunch: false
+    });
+    const rdsSubnetB = new Subnet(this, 'rds-subnet-b', {
+      vpcId: this.vpc.id,
+      cidrBlock: '10.0.2.0/24',
+      availabilityZone: 'eu-central-1b',
+      mapPublicIpOnLaunch: false
     });
 
     // This is the S3 bucket where the Glue job script and resources will live
@@ -40,14 +58,15 @@ class MyStack extends TerraformStack {
     // This is the security group the Glue job will use to access the RDS database
     const glueSecurityGroup = new SecurityGroup(this, 'glue-security-group', {
       name: 'glue-security-group',
-      description: 'Security group for Glue job'
+      description: 'Security group for Glue job',
+      vpcId: this.vpc.id
     });
 
     // The RDS cluster
-    this.rdsCluster = this.setupRdsCluster(glueSecurityGroup);
+    this.rdsCluster = this.setupRdsCluster([rdsSubnetA.id, rdsSubnetB.id], glueSecurityGroup);
   }
 
-  private setupRdsCluster(glueSecurityGroup: SecurityGroup) {
+  private setupRdsCluster(subnetIds: string[], glueSecurityGroup: SecurityGroup) {
     // This is the security group for the RDS database
     const rdsSecurityGroup = this.setupRdsSecurity(this.vpc, this, glueSecurityGroup);
 
@@ -59,6 +78,12 @@ class MyStack extends TerraformStack {
     });
     // NOTE: we will be using the master user to access the RDS, DO NOT DO THIS IN PRODUCTION!!!
 
+    // RDS subnet group
+    const subnetGroup = new DbSubnetGroup(this, 'rds-subnet-group', {
+      name: 'rds-subnet-group',
+      subnetIds: subnetIds
+    });
+
     // This is the RDS database where the Glue job will write to
     const rdsCluster = new RdsCluster(this, 'rds-cluster', {
       clusterIdentifier: 'rds-cluster',
@@ -68,8 +93,9 @@ class MyStack extends TerraformStack {
       databaseName: 'glue',
       masterUsername: rdsMasterUsername,
       masterPassword: rdsMasterUserPassword.result,
-      availabilityZones: ['eu-central-1a', 'eu-central-1b'],
-      vpcSecurityGroupIds: [rdsSecurityGroup.id]
+      vpcSecurityGroupIds: [rdsSecurityGroup.id],
+      dbSubnetGroupName: subnetGroup.name,
+      skipFinalSnapshot: true
     });
 
     // Store master user credentials in secrets manager
@@ -125,8 +151,8 @@ class MyStack extends TerraformStack {
       fromPort: 5432,
       toPort: 5432,
       protocol: 'tcp',
-      securityGroupId: glueSecurityGroup.id,
-      sourceSecurityGroupId: rdsSecurityGroup.id
+      securityGroupId: rdsSecurityGroup.id,
+      sourceSecurityGroupId: glueSecurityGroup.id
     });
     return rdsSecurityGroup;
   }
