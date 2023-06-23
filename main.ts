@@ -1,7 +1,10 @@
 // Copyright (c) HashiCorp, Inc
 // SPDX-License-Identifier: MPL-2.0
+import { readdirSync } from 'fs';
+import path from 'path';
+
 import { Construct } from 'constructs';
-import { App, TerraformStack } from 'cdktf';
+import { App, Fn, TerraformStack } from 'cdktf';
 import { AwsProvider } from '@cdktf/provider-aws/lib/provider';
 import { Vpc } from '@cdktf/provider-aws/lib/vpc';
 import { S3Bucket } from '@cdktf/provider-aws/lib/s3-bucket';
@@ -15,10 +18,18 @@ import { RandomProvider } from '@cdktf/provider-random/lib/provider';
 import { Subnet } from '@cdktf/provider-aws/lib/subnet';
 import { DbSubnetGroup } from '@cdktf/provider-aws/lib/db-subnet-group';
 import { s3BucketPublicAccessBlock } from '@cdktf/provider-aws';
+import { IamRole } from '@cdktf/provider-aws/lib/iam-role';
+import { IamPolicy } from '@cdktf/provider-aws/lib/iam-policy';
+import { DataAwsIamPolicyDocument } from '@cdktf/provider-aws/lib/data-aws-iam-policy-document';
+import { GlueJob } from '@cdktf/provider-aws/lib/glue-job';
+import { S3Object } from '@cdktf/provider-aws/lib/s3-object';
+import { KmsKey } from '@cdktf/provider-aws/lib/kms-key';
+import { GlueConnection } from '@cdktf/provider-aws/lib/glue-connection';
 
 class MyStack extends TerraformStack {
   readonly vpc: Vpc;
   readonly rdsCluster: RdsCluster;
+  readonly rdsClusterSecret: SecretsmanagerSecret;
 
   constructor(scope: Construct, id: string) {
     super(scope, id);
@@ -70,20 +81,40 @@ class MyStack extends TerraformStack {
       vpcId: this.vpc.id
     });
 
-    // The RDS cluster
-    this.rdsCluster = this.setupRdsCluster([rdsSubnetA.id, rdsSubnetB.id], glueSecurityGroup);
-  }
-
-  private setupRdsCluster(subnetIds: string[], glueSecurityGroup: SecurityGroup) {
-    // This is the security group for the RDS database
-    const rdsSecurityGroup = this.setupRdsSecurity(this.vpc, this, glueSecurityGroup);
-
-    const rdsMasterUsername = 'gluedbadmin';
     // The RDS master user password
+    const rdsMasterUsername = 'gluedbadmin';
     const rdsMasterUserPassword = new Password(this, 'rds-master-user-password', {
       length: 48,
       special: false
     });
+
+    // The RDS cluster
+    this.rdsCluster = this.setupRdsCluster(
+      [rdsSubnetA.id, rdsSubnetB.id],
+      glueSecurityGroup,
+      rdsMasterUsername,
+      rdsMasterUserPassword.result
+    );
+
+    this.rdsClusterSecret = this.setupRdsClusterSecret(
+      this.rdsCluster,
+      rdsMasterUsername,
+      rdsMasterUserPassword.result
+    );
+
+    // The Glue job
+    this.createGlueJob(glueScriptsBucket, this.rdsCluster, this.rdsClusterSecret, glueSecurityGroup, rdsSubnetA.id);
+  }
+
+  private setupRdsCluster(
+    subnetIds: string[],
+    glueSecurityGroup: SecurityGroup,
+    rdsMasterUsername: string,
+    rdsMasterUserPassword: string
+  ) {
+    // This is the security group for the RDS database
+    const rdsSecurityGroup = this.setupRdsSecurity(this.vpc, this, glueSecurityGroup);
+
     // NOTE: we will be using the master user to access the RDS, DO NOT DO THIS IN PRODUCTION!!!
 
     // RDS subnet group
@@ -100,12 +131,16 @@ class MyStack extends TerraformStack {
       engineVersion: '15.2',
       databaseName: 'glue',
       masterUsername: rdsMasterUsername,
-      masterPassword: rdsMasterUserPassword.result,
+      masterPassword: rdsMasterUserPassword,
       vpcSecurityGroupIds: [rdsSecurityGroup.id],
       dbSubnetGroupName: subnetGroup.name,
       skipFinalSnapshot: true
     });
 
+    return rdsCluster;
+  }
+
+  private setupRdsClusterSecret(rdsCluster: RdsCluster, rdsMasterUsername: string, rdsMasterUserPassword: string) {
     // Store master user credentials in secrets manager
     const rdsMasterUserSecret = new SecretsmanagerSecret(this, 'rds-master-user-secret', {
       name: 'rds-master-user-secret',
@@ -115,7 +150,7 @@ class MyStack extends TerraformStack {
       secretId: rdsMasterUserSecret.id,
       secretString: JSON.stringify({
         dbClusterIdentifier: rdsCluster.clusterIdentifier,
-        password: rdsMasterUserPassword.result,
+        password: rdsMasterUserPassword,
         dbName: rdsCluster.databaseName,
         port: 5432,
         host: rdsCluster.endpoint,
@@ -123,7 +158,7 @@ class MyStack extends TerraformStack {
       })
     });
 
-    return rdsCluster;
+    return rdsMasterUserSecret;
   }
 
   private setupRdsSecurity(vpc: Vpc, scope: Construct, glueSecurityGroup: SecurityGroup) {
@@ -163,6 +198,107 @@ class MyStack extends TerraformStack {
       sourceSecurityGroupId: glueSecurityGroup.id
     });
     return rdsSecurityGroup;
+  }
+
+  private createGlueJob(
+    glueScriptsBucket: S3Bucket,
+    rdsCluster: RdsCluster,
+    rdsMasterUserSecret: SecretsmanagerSecret,
+    rdsSecurityGroup: SecurityGroup,
+    subnetId: string
+  ) {
+    const jobPolicyDocument = new DataAwsIamPolicyDocument(this, 'glue-job-policy-document', {
+      version: '2012-10-17',
+      statement: [
+        {
+          sid: 'glue-job-allow-s3-access',
+          effect: 'Allow',
+          actions: ['s3:GetObject', 's3:ListBucket'],
+          resources: [`${glueScriptsBucket.arn}/*`, `${glueScriptsBucket.arn}`]
+        },
+        {
+          sid: 'glue-job-allow-rds-secret-access',
+          effect: 'Allow',
+          actions: ['secretsmanager:GetSecretValue'],
+          resources: [rdsMasterUserSecret.arn]
+        }
+      ]
+    });
+
+    const jobPolicy = new IamPolicy(this, 'glue-job-policy', {
+      name: 'glue-job-policy',
+      policy: jobPolicyDocument.json
+    });
+
+    const jobRole = new IamRole(this, 'glue-job-role', {
+      name: 'glue-job-role',
+      assumeRolePolicy: JSON.stringify({
+        Version: '2012-10-17',
+        Statement: [
+          {
+            Effect: 'Allow',
+            Principal: {
+              Service: 'glue.amazonaws.com'
+            },
+            Action: 'sts:AssumeRole'
+          }
+        ]
+      }),
+      managedPolicyArns: [jobPolicy.arn, 'arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole']
+    });
+
+    const rdsConnection = new GlueConnection(this, 'rds-connection', {
+      name: 'rds-connection',
+      connectionProperties: {
+        JDBC_CONNECTION_URL: `jdbc:postgresql://${rdsCluster.endpoint}/${rdsCluster.databaseName}`,
+        JDBC_ENFORCE_SSL: 'true',
+        SECRET_ID: rdsMasterUserSecret.id
+      },
+      physicalConnectionRequirements: {
+        availabilityZone: rdsCluster.availabilityZones[0],
+        securityGroupIdList: [rdsSecurityGroup.id],
+        subnetId: subnetId
+      }
+    });
+
+    new GlueJob(this, 'glue-job', {
+      name: 'glue-job',
+      command: {
+        name: 'pythonshell',
+        pythonVersion: '3.9',
+        scriptLocation: `s3://${glueScriptsBucket.id}/generate_data_to_rds.py`
+      },
+      connections: [rdsConnection.id], // This puts the Glue job in the same VPC as the RDS database
+      glueVersion: '3.0',
+      maxCapacity: 0.0625,
+      executionClass: 'STANDARD',
+      defaultArguments: {
+        '--enable-metrics': 'true',
+        '--job-language': 'python',
+        'library-set': 'analytics' // This allows us to use AWSWrangler, Pandas etc. in the Glue job
+      },
+      roleArn: jobRole.arn,
+      timeout: 60
+    });
+  }
+
+  private uploadJobScripts(bucket: S3Bucket, bucketKey: KmsKey) {
+    const dirPath = path.resolve(__dirname, '../../../../glue-jobs');
+    const jobScriptFiles = readdirSync(dirPath, {
+      withFileTypes: true
+    });
+    jobScriptFiles.forEach((f) => {
+      if (f.isFile()) {
+        const filePath = `${dirPath}/${f.name}`;
+        new S3Object(this, `job-script-object-${f.name}`, {
+          bucket: bucket.id,
+          source: filePath,
+          key: f.name,
+          kmsKeyId: bucketKey.arn,
+          sourceHash: Fn.filemd5(filePath)
+        });
+      }
+    });
   }
 }
 
