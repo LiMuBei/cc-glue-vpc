@@ -3,6 +3,7 @@
     "alwaysStrict": true,
     "declaration": true,
     "experimentalDecorators": true,
+    "esModuleInterop": true,
     "inlineSourceMap": true,
     "inlineSources": true,
     "lib": [
