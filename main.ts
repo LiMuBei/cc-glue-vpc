@@ -1,8 +1,5 @@
 // Copyright (c) HashiCorp, Inc
 // SPDX-License-Identifier: MPL-2.0
-import { readdirSync } from 'fs';
-import path from 'path';
-
 import { Construct } from 'constructs';
 import { App, Fn, TerraformStack } from 'cdktf';
 import { AwsProvider } from '@cdktf/provider-aws/lib/provider';
@@ -23,7 +20,6 @@ import { IamPolicy } from '@cdktf/provider-aws/lib/iam-policy';
 import { DataAwsIamPolicyDocument } from '@cdktf/provider-aws/lib/data-aws-iam-policy-document';
 import { GlueJob } from '@cdktf/provider-aws/lib/glue-job';
 import { S3Object } from '@cdktf/provider-aws/lib/s3-object';
-import { KmsKey } from '@cdktf/provider-aws/lib/kms-key';
 import { GlueConnection } from '@cdktf/provider-aws/lib/glue-connection';
 
 class MyStack extends TerraformStack {
@@ -261,6 +257,22 @@ class MyStack extends TerraformStack {
       }
     });
 
+    // Upload job script to S3
+    new S3Object(this, 'glue_job_script', {
+      bucket: glueScriptsBucket.id,
+      key: 'generate_data_to_rds.py',
+      source: './glue_scripts/jobs/generate_data_to_rds.py',
+      sourceHash: Fn.filemd5('./glue_scripts/jobs/generate_data_to_rds.py')
+    });
+
+    // Upload job Python package to S3
+    new S3Object(this, 'glue_job_lib', {
+      bucket: glueScriptsBucket.id,
+      key: 'glue_scripts-0.1.0-py3-none-any.whl',
+      source: './glue_scripts/dist/glue_scripts-0.1.0-py3-none-any.whl',
+      sourceHash: Fn.filemd5('./glue_scripts/dist/glue_scripts-0.1.0-py3-none-any.whl')
+    });
+
     new GlueJob(this, 'glue-job', {
       name: 'glue-job',
       command: {
@@ -275,29 +287,11 @@ class MyStack extends TerraformStack {
       defaultArguments: {
         '--enable-metrics': 'true',
         '--job-language': 'python',
-        'library-set': 'analytics' // This allows us to use AWSWrangler, Pandas etc. in the Glue job
+        'library-set': 'analytics', // This allows us to use AWSWrangler, Pandas etc. in the Glue job
+        '--additional-python-modules': `s3://${glueScriptsBucket.id}/glue_scripts-0.1.0-py3-none-any.whl`
       },
       roleArn: jobRole.arn,
       timeout: 60
-    });
-  }
-
-  private uploadJobScripts(bucket: S3Bucket, bucketKey: KmsKey) {
-    const dirPath = path.resolve(__dirname, '../../../../glue-jobs');
-    const jobScriptFiles = readdirSync(dirPath, {
-      withFileTypes: true
-    });
-    jobScriptFiles.forEach((f) => {
-      if (f.isFile()) {
-        const filePath = `${dirPath}/${f.name}`;
-        new S3Object(this, `job-script-object-${f.name}`, {
-          bucket: bucket.id,
-          source: filePath,
-          key: f.name,
-          kmsKeyId: bucketKey.arn,
-          sourceHash: Fn.filemd5(filePath)
-        });
-      }
     });
   }
 }

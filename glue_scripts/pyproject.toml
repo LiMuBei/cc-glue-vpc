@@ -4,7 +4,7 @@ version = "0.1.0"
 description = ""
 authors = ["Alexander Kasper <alexander.kasper@codecentric.de>"]
 readme = "README.md"
-packages = [{include = "glue_scripts"}]
+packages = [{include = "glue_job_lib"}]
 
 [tool.poetry.dependencies]
 python = "^3.11"
