@@ -21,11 +21,17 @@ import { DataAwsIamPolicyDocument } from '@cdktf/provider-aws/lib/data-aws-iam-p
 import { GlueJob } from '@cdktf/provider-aws/lib/glue-job';
 import { S3Object } from '@cdktf/provider-aws/lib/s3-object';
 import { GlueConnection } from '@cdktf/provider-aws/lib/glue-connection';
+import { VpcEndpoint } from '@cdktf/provider-aws/lib/vpc-endpoint';
+import { RouteTable } from '@cdktf/provider-aws/lib/route-table';
+import { RouteTableAssociation } from '@cdktf/provider-aws/lib/route-table-association';
+import { VpcEndpointRouteTableAssociation } from '@cdktf/provider-aws/lib/vpc-endpoint-route-table-association';
 
 class MyStack extends TerraformStack {
   readonly vpc: Vpc;
   readonly rdsCluster: RdsCluster;
   readonly rdsClusterSecret: SecretsmanagerSecret;
+  readonly s3Endpoint: VpcEndpoint;
+  readonly endpointsSecurityGroup: SecurityGroup;
 
   constructor(scope: Construct, id: string) {
     super(scope, id);
@@ -43,6 +49,25 @@ class MyStack extends TerraformStack {
       enableDnsSupport: true
     });
 
+    this.s3Endpoint = new VpcEndpoint(this, 's3-endpoint', {
+      vpcId: this.vpc.id,
+      serviceName: 'com.amazonaws.eu-central-1.s3'
+    });
+
+    this.endpointsSecurityGroup = new SecurityGroup(this, 'endpoints-security-group', {
+      name: 'endpoints-security-group',
+      description: 'Security group for VPC endpoints',
+      vpcId: this.vpc.id
+    });
+    new SecurityGroupRule(this, 'endpoints-security-group-egress-rule', {
+      securityGroupId: this.endpointsSecurityGroup.id,
+      type: 'egress',
+      fromPort: 0,
+      toPort: 65535,
+      protocol: 'tcp',
+      cidrBlocks: ['0.0.0.0/0']
+    });
+
     // Create isolated subnets for the RDS database
     const rdsSubnetA = new Subnet(this, 'rds-subnet-a', {
       vpcId: this.vpc.id,
@@ -55,6 +80,24 @@ class MyStack extends TerraformStack {
       cidrBlock: '10.0.2.0/24',
       availabilityZone: 'eu-central-1b',
       mapPublicIpOnLaunch: false
+    });
+
+    // Route traffic from subnets to the S3 endpoint
+    const s3EndpointRouteTable = new RouteTable(this, 's3-endpoint-route-table', {
+      vpcId: this.vpc.id,
+      route: []
+    });
+    new RouteTableAssociation(this, 'rds-subnet-a-route-table-association', {
+      subnetId: rdsSubnetA.id,
+      routeTableId: s3EndpointRouteTable.id
+    });
+    new RouteTableAssociation(this, 'rds-subnet-b-route-table-association', {
+      subnetId: rdsSubnetB.id,
+      routeTableId: s3EndpointRouteTable.id
+    });
+    new VpcEndpointRouteTableAssociation(this, 's3-endpoint-route-table-association', {
+      routeTableId: s3EndpointRouteTable.id,
+      vpcEndpointId: this.s3Endpoint.id
     });
 
     // This is the S3 bucket where the Glue job script and resources will live
@@ -109,7 +152,7 @@ class MyStack extends TerraformStack {
     rdsMasterUserPassword: string
   ) {
     // This is the security group for the RDS database
-    const rdsSecurityGroup = this.setupRdsSecurity(this.vpc, this, glueSecurityGroup);
+    const rdsSecurityGroup = this.setupRdsSecurity(this.vpc, glueSecurityGroup);
 
     // NOTE: we will be using the master user to access the RDS, DO NOT DO THIS IN PRODUCTION!!!
 
@@ -139,7 +182,7 @@ class MyStack extends TerraformStack {
   private setupRdsClusterSecret(rdsCluster: RdsCluster, rdsMasterUsername: string, rdsMasterUserPassword: string) {
     // Store master user credentials in secrets manager
     const rdsMasterUserSecret = new SecretsmanagerSecret(this, 'rds-master-user-secret', {
-      name: 'rds-master-user-secret',
+      name: 'rds-master-user-secret-2',
       description: 'RDS master user secret'
     });
     new SecretsmanagerSecretVersion(this, 'rds-master-user-secret-version', {
@@ -157,26 +200,14 @@ class MyStack extends TerraformStack {
     return rdsMasterUserSecret;
   }
 
-  private setupRdsSecurity(vpc: Vpc, scope: Construct, glueSecurityGroup: SecurityGroup) {
+  private setupRdsSecurity(vpc: Vpc, glueSecurityGroup: SecurityGroup) {
     const rdsSecurityGroup = new SecurityGroup(this, 'rds-security-group', {
       name: 'rds-security-group',
       description: 'Security group for RDS database',
       vpcId: vpc.id
     });
 
-    // Disallow all outbound traffic from the RDS database
-    new SecurityGroupRule(scope, `rds-disallow-all-outbound-rule`, {
-      securityGroupId: rdsSecurityGroup.id,
-      description: 'Disallow all outbound traffic',
-      type: 'egress',
-      protocol: 'icmp',
-      fromPort: 252,
-      toPort: 86,
-      cidrBlocks: ['255.255.255.255/32']
-    });
-
-    // This is the security ingress group rule allowing access to the RDS database from the Glue job
-    new SecurityGroupRule(this, 'rds-security-group-rule', {
+    new SecurityGroupRule(this, 'rds-security-group-ingress-rule', {
       type: 'ingress',
       fromPort: 5432,
       toPort: 5432,
@@ -184,15 +215,32 @@ class MyStack extends TerraformStack {
       securityGroupId: rdsSecurityGroup.id,
       sourceSecurityGroupId: glueSecurityGroup.id
     });
-    // This is the security group egress rule allowing access to the Glue job from the RDS database
-    new SecurityGroupRule(this, 'glue-security-group-rule', {
+    new SecurityGroupRule(this, 'rds-security-group-egress-rule', {
       type: 'egress',
       fromPort: 5432,
       toPort: 5432,
       protocol: 'tcp',
-      securityGroupId: rdsSecurityGroup.id,
+      securityGroupId: glueSecurityGroup.id,
+      sourceSecurityGroupId: rdsSecurityGroup.id
+    });
+
+    new SecurityGroupRule(this, 'glue-security-group-ingress-rule', {
+      type: 'ingress',
+      fromPort: 0,
+      toPort: 65535,
+      protocol: 'tcp',
+      securityGroupId: glueSecurityGroup.id,
       sourceSecurityGroupId: glueSecurityGroup.id
     });
+    new SecurityGroupRule(this, 'glue-security-group-egress-rule', {
+      type: 'egress',
+      fromPort: 0,
+      toPort: 65535,
+      protocol: 'tcp',
+      securityGroupId: glueSecurityGroup.id,
+      sourceSecurityGroupId: glueSecurityGroup.id
+    });
+
     return rdsSecurityGroup;
   }
 
@@ -200,20 +248,20 @@ class MyStack extends TerraformStack {
     glueScriptsBucket: S3Bucket,
     rdsCluster: RdsCluster,
     rdsMasterUserSecret: SecretsmanagerSecret,
-    rdsSecurityGroup: SecurityGroup,
+    glueSecurityGroup: SecurityGroup,
     subnetId: string
   ) {
     const jobPolicyDocument = new DataAwsIamPolicyDocument(this, 'glue-job-policy-document', {
       version: '2012-10-17',
       statement: [
         {
-          sid: 'glue-job-allow-s3-access',
+          sid: 'GlueJobAllowS3Access',
           effect: 'Allow',
           actions: ['s3:GetObject', 's3:ListBucket'],
           resources: [`${glueScriptsBucket.arn}/*`, `${glueScriptsBucket.arn}`]
         },
         {
-          sid: 'glue-job-allow-rds-secret-access',
+          sid: 'GlueJobAllowRdsSecretAccess',
           effect: 'Allow',
           actions: ['secretsmanager:GetSecretValue'],
           resources: [rdsMasterUserSecret.arn]
@@ -251,26 +299,57 @@ class MyStack extends TerraformStack {
         SECRET_ID: rdsMasterUserSecret.id
       },
       physicalConnectionRequirements: {
-        availabilityZone: rdsCluster.availabilityZones[0],
-        securityGroupIdList: [rdsSecurityGroup.id],
+        availabilityZone: Fn.element(rdsCluster.availabilityZones, 0),
+        securityGroupIdList: [glueSecurityGroup.id],
         subnetId: subnetId
       }
     });
+
+    // Allow access via S3 endpoint
+    new SecurityGroupRule(this, 'glue-security-group-s3-endpoint-egress-rule', {
+      description: 'Allow Glue access to S3 endpoint',
+      type: 'egress',
+      fromPort: 443,
+      toPort: 443,
+      protocol: 'tcp',
+      securityGroupId: glueSecurityGroup.id,
+      prefixListIds: [this.s3Endpoint.prefixListId]
+    });
+    // Allow Glue access to endpoints
+    new SecurityGroupRule(this, 'glue-security-group-endpoints-egress-rule', {
+      description: 'Allow Glue access to endpoints',
+      type: 'egress',
+      fromPort: 443,
+      toPort: 443,
+      protocol: 'tcp',
+      sourceSecurityGroupId: glueSecurityGroup.id,
+      securityGroupId: this.endpointsSecurityGroup.id
+    });
+    new SecurityGroupRule(this, 'glue-security-group-endpoints-ingress-rule', {
+      description: 'Allow Glue access to endpoints',
+      type: 'ingress',
+      fromPort: 443,
+      toPort: 443,
+      protocol: 'tcp',
+      sourceSecurityGroupId: this.endpointsSecurityGroup.id,
+      securityGroupId: glueSecurityGroup.id
+    });
+      
 
     // Upload job script to S3
     new S3Object(this, 'glue_job_script', {
       bucket: glueScriptsBucket.id,
       key: 'generate_data_to_rds.py',
-      source: './glue_scripts/jobs/generate_data_to_rds.py',
-      sourceHash: Fn.filemd5('./glue_scripts/jobs/generate_data_to_rds.py')
+      source: `${__dirname}/glue_scripts/jobs/generate_data_to_rds.py`,
+      sourceHash: Fn.filemd5(`${__dirname}/glue_scripts/jobs/generate_data_to_rds.py`)
     });
 
     // Upload job Python package to S3
     new S3Object(this, 'glue_job_lib', {
       bucket: glueScriptsBucket.id,
       key: 'glue_scripts-0.1.0-py3-none-any.whl',
-      source: './glue_scripts/dist/glue_scripts-0.1.0-py3-none-any.whl',
-      sourceHash: Fn.filemd5('./glue_scripts/dist/glue_scripts-0.1.0-py3-none-any.whl')
+      source: `${__dirname}/glue_scripts/dist/glue_scripts-0.1.0-py3-none-any.whl`,
+      sourceHash: Fn.filemd5(`${__dirname}/glue_scripts/dist/glue_scripts-0.1.0-py3-none-any.whl`)
     });
 
     new GlueJob(this, 'glue-job', {
@@ -280,7 +359,7 @@ class MyStack extends TerraformStack {
         pythonVersion: '3.9',
         scriptLocation: `s3://${glueScriptsBucket.id}/generate_data_to_rds.py`
       },
-      connections: [rdsConnection.id], // This puts the Glue job in the same VPC as the RDS database
+      connections: [rdsConnection.name], // This puts the Glue job in the same VPC as the RDS database
       glueVersion: '3.0',
       maxCapacity: 0.0625,
       executionClass: 'STANDARD',
@@ -288,7 +367,9 @@ class MyStack extends TerraformStack {
         '--enable-metrics': 'true',
         '--job-language': 'python',
         'library-set': 'analytics', // This allows us to use AWSWrangler, Pandas etc. in the Glue job
-        '--additional-python-modules': `s3://${glueScriptsBucket.id}/glue_scripts-0.1.0-py3-none-any.whl`
+        '--enable-job-insights': 'false',
+        '--extra-py-files': `s3://${glueScriptsBucket.id}/glue_scripts-0.1.0-py3-none-any.whl`,
+        '--python-modules-installer-option': `--no-index --no-deps --find-links s3://${glueScriptsBucket.id}/`,
       },
       roleArn: jobRole.arn,
       timeout: 60
