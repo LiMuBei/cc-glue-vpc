@@ -7,12 +7,12 @@ readme = "README.md"
 packages = [{include = "glue_job_lib"}]
 
 [tool.poetry.dependencies]
-python = "^3.11"
-awswrangler = "^3.2.1"
-pg8000 = "^1.29.7"
+python = "3.9.10"
+awswrangler = "2.15.1"
+psycopg2 = "2.9.3"
 
 [tool.poetry.group.dev.dependencies]
-pandas = "^2.0.2"
+pandas = "1.4.2"
 flake8 = "^6.0.0"
 flake8-unused-arguments = "^0.0.13"
 black = "^23.3.0"
