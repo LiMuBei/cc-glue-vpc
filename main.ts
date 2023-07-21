@@ -21,17 +21,19 @@ import { DataAwsIamPolicyDocument } from '@cdktf/provider-aws/lib/data-aws-iam-p
 import { GlueJob } from '@cdktf/provider-aws/lib/glue-job';
 import { S3Object } from '@cdktf/provider-aws/lib/s3-object';
 import { GlueConnection } from '@cdktf/provider-aws/lib/glue-connection';
-import { VpcEndpoint } from '@cdktf/provider-aws/lib/vpc-endpoint';
+import { InternetGateway } from '@cdktf/provider-aws/lib/internet-gateway';
 import { RouteTable } from '@cdktf/provider-aws/lib/route-table';
+import { Route } from '@cdktf/provider-aws/lib/route';
 import { RouteTableAssociation } from '@cdktf/provider-aws/lib/route-table-association';
-import { VpcEndpointRouteTableAssociation } from '@cdktf/provider-aws/lib/vpc-endpoint-route-table-association';
+import { NatGateway } from '@cdktf/provider-aws/lib/nat-gateway';
+import { Eip } from '@cdktf/provider-aws/lib/eip';
 
 class MyStack extends TerraformStack {
   readonly vpc: Vpc;
   readonly rdsCluster: RdsCluster;
   readonly rdsClusterSecret: SecretsmanagerSecret;
-  readonly s3Endpoint: VpcEndpoint;
-  readonly endpointsSecurityGroup: SecurityGroup;
+  readonly rdsSubnets: Subnet[];
+  readonly glueSubnet: Subnet;
 
   constructor(scope: Construct, id: string) {
     super(scope, id);
@@ -49,55 +51,88 @@ class MyStack extends TerraformStack {
       enableDnsSupport: true
     });
 
-    this.s3Endpoint = new VpcEndpoint(this, 's3-endpoint', {
-      vpcId: this.vpc.id,
-      serviceName: 'com.amazonaws.eu-central-1.s3'
-    });
-
-    this.endpointsSecurityGroup = new SecurityGroup(this, 'endpoints-security-group', {
-      name: 'endpoints-security-group',
-      description: 'Security group for VPC endpoints',
-      vpcId: this.vpc.id
-    });
-    new SecurityGroupRule(this, 'endpoints-security-group-egress-rule', {
-      securityGroupId: this.endpointsSecurityGroup.id,
-      type: 'egress',
-      fromPort: 0,
-      toPort: 65535,
-      protocol: 'tcp',
-      cidrBlocks: ['0.0.0.0/0']
-    });
-
     // Create isolated subnets for the RDS database
     const rdsSubnetA = new Subnet(this, 'rds-subnet-a', {
       vpcId: this.vpc.id,
       cidrBlock: '10.0.1.0/24',
       availabilityZone: 'eu-central-1a',
-      mapPublicIpOnLaunch: false
+      mapPublicIpOnLaunch: false,
+      tags: {
+        Name: 'rds-subnet-a'
+      }
     });
     const rdsSubnetB = new Subnet(this, 'rds-subnet-b', {
       vpcId: this.vpc.id,
       cidrBlock: '10.0.2.0/24',
       availabilityZone: 'eu-central-1b',
-      mapPublicIpOnLaunch: false
+      mapPublicIpOnLaunch: false,
+      tags: {
+        Name: 'rds-subnet-b'
+      }
+    });
+    this.rdsSubnets = [rdsSubnetA, rdsSubnetB];
+
+    // Create private subnet for Glue jobs
+    this.glueSubnet = new Subnet(this, 'glue-subnet', {
+      vpcId: this.vpc.id,
+      cidrBlock: '10.0.3.0/24',
+      availabilityZone: 'eu-central-1a',
+      mapPublicIpOnLaunch: false,
+      tags: {
+        Name: 'glue-subnet'
+      }
     });
 
-    // Route traffic from subnets to the S3 endpoint
-    const s3EndpointRouteTable = new RouteTable(this, 's3-endpoint-route-table', {
+    // Create a public subnet for the internet gateway and nat gateway
+    const publicSubnet = new Subnet(this, 'public-subnet', {
       vpcId: this.vpc.id,
-      route: []
+      cidrBlock: '10.0.4.0/24',
+      availabilityZone: 'eu-central-1a',
+      tags: {
+        Name: 'public-subnet'
+      }
     });
-    new RouteTableAssociation(this, 'rds-subnet-a-route-table-association', {
-      subnetId: rdsSubnetA.id,
-      routeTableId: s3EndpointRouteTable.id
+
+    // Internet gateway for the VPC
+    const internetGateway = new InternetGateway(this, 'internet-gateway', {
+      vpcId: this.vpc.id
     });
-    new RouteTableAssociation(this, 'rds-subnet-b-route-table-association', {
-      subnetId: rdsSubnetB.id,
-      routeTableId: s3EndpointRouteTable.id
+
+    // Route traffic from public subnet to internet gateway
+    const publicSubnetRouteTable = new RouteTable(this, 'public-subnet-route-table', {
+      vpcId: this.vpc.id
     });
-    new VpcEndpointRouteTableAssociation(this, 's3-endpoint-route-table-association', {
-      routeTableId: s3EndpointRouteTable.id,
-      vpcEndpointId: this.s3Endpoint.id
+    new RouteTableAssociation(this, 'public-subnet-route-table-association', {
+      routeTableId: publicSubnetRouteTable.id,
+      subnetId: publicSubnet.id
+    });
+    new Route(this, 'public-subnet-route', {
+      routeTableId: publicSubnetRouteTable.id,
+      destinationCidrBlock: '0.0.0.0/0',
+      gatewayId: internetGateway.id
+    });
+
+    // Elastic IP for NAT gateway
+    const elasticIp = new Eip(this, 'elastic-ip', {
+      vpc: true
+    });
+    // Setup NAT gateway for glue subnet
+    const natGateway = new NatGateway(this, 'nat-gateway', {
+      allocationId: elasticIp.id,
+      subnetId: publicSubnet.id
+    });
+    // Route traffic from glue subnet to NAT gateway
+    const glueSubnetRouteTable = new RouteTable(this, 'glue-subnet-route-table', {
+      vpcId: this.vpc.id
+    });
+    new RouteTableAssociation(this, 'glue-subnet-route-table-association', {
+      routeTableId: glueSubnetRouteTable.id,
+      subnetId: this.glueSubnet.id
+    });
+    new Route(this, 'glue-subnet-route', {
+      routeTableId: glueSubnetRouteTable.id,
+      destinationCidrBlock: '0.0.0.0/0',
+      natGatewayId: natGateway.id
     });
 
     // This is the S3 bucket where the Glue job script and resources will live
@@ -119,6 +154,15 @@ class MyStack extends TerraformStack {
       description: 'Security group for Glue job',
       vpcId: this.vpc.id
     });
+    // Allow glue security group to access AWS services
+    new SecurityGroupRule(this, 'glue-security-group-egress-aws-services-rule', {
+      type: 'egress',
+      fromPort: 443,
+      toPort: 443,
+      protocol: 'tcp',
+      securityGroupId: glueSecurityGroup.id,
+      cidrBlocks: ['0.0.0.0/0']
+    });
 
     // The RDS master user password
     const rdsMasterUsername = 'gluedbadmin';
@@ -128,12 +172,7 @@ class MyStack extends TerraformStack {
     });
 
     // The RDS cluster
-    this.rdsCluster = this.setupRdsCluster(
-      [rdsSubnetA.id, rdsSubnetB.id],
-      glueSecurityGroup,
-      rdsMasterUsername,
-      rdsMasterUserPassword.result
-    );
+    this.rdsCluster = this.setupRdsCluster(glueSecurityGroup, rdsMasterUsername, rdsMasterUserPassword.result);
 
     this.rdsClusterSecret = this.setupRdsClusterSecret(
       this.rdsCluster,
@@ -142,15 +181,10 @@ class MyStack extends TerraformStack {
     );
 
     // The Glue job
-    this.createGlueJob(glueScriptsBucket, this.rdsCluster, this.rdsClusterSecret, glueSecurityGroup, rdsSubnetA.id);
+    this.createGlueJob(glueScriptsBucket, this.rdsCluster, this.rdsClusterSecret, glueSecurityGroup);
   }
 
-  private setupRdsCluster(
-    subnetIds: string[],
-    glueSecurityGroup: SecurityGroup,
-    rdsMasterUsername: string,
-    rdsMasterUserPassword: string
-  ) {
+  private setupRdsCluster(glueSecurityGroup: SecurityGroup, rdsMasterUsername: string, rdsMasterUserPassword: string) {
     // This is the security group for the RDS database
     const rdsSecurityGroup = this.setupRdsSecurity(this.vpc, glueSecurityGroup);
 
@@ -159,7 +193,7 @@ class MyStack extends TerraformStack {
     // RDS subnet group
     const subnetGroup = new DbSubnetGroup(this, 'rds-subnet-group', {
       name: 'rds-subnet-group',
-      subnetIds: subnetIds
+      subnetIds: this.rdsSubnets.map((subnet) => subnet.id)
     });
 
     // This is the RDS database where the Glue job will write to
@@ -248,8 +282,7 @@ class MyStack extends TerraformStack {
     glueScriptsBucket: S3Bucket,
     rdsCluster: RdsCluster,
     rdsMasterUserSecret: SecretsmanagerSecret,
-    glueSecurityGroup: SecurityGroup,
-    subnetId: string
+    glueSecurityGroup: SecurityGroup
   ) {
     const jobPolicyDocument = new DataAwsIamPolicyDocument(this, 'glue-job-policy-document', {
       version: '2012-10-17',
@@ -299,42 +332,11 @@ class MyStack extends TerraformStack {
         SECRET_ID: rdsMasterUserSecret.id
       },
       physicalConnectionRequirements: {
-        availabilityZone: Fn.element(rdsCluster.availabilityZones, 0),
+        availabilityZone: this.glueSubnet.availabilityZone,
         securityGroupIdList: [glueSecurityGroup.id],
-        subnetId: subnetId
+        subnetId: this.glueSubnet.id
       }
     });
-
-    // Allow access via S3 endpoint
-    new SecurityGroupRule(this, 'glue-security-group-s3-endpoint-egress-rule', {
-      description: 'Allow Glue access to S3 endpoint',
-      type: 'egress',
-      fromPort: 443,
-      toPort: 443,
-      protocol: 'tcp',
-      securityGroupId: glueSecurityGroup.id,
-      prefixListIds: [this.s3Endpoint.prefixListId]
-    });
-    // Allow Glue access to endpoints
-    new SecurityGroupRule(this, 'glue-security-group-endpoints-egress-rule', {
-      description: 'Allow Glue access to endpoints',
-      type: 'egress',
-      fromPort: 443,
-      toPort: 443,
-      protocol: 'tcp',
-      sourceSecurityGroupId: glueSecurityGroup.id,
-      securityGroupId: this.endpointsSecurityGroup.id
-    });
-    new SecurityGroupRule(this, 'glue-security-group-endpoints-ingress-rule', {
-      description: 'Allow Glue access to endpoints',
-      type: 'ingress',
-      fromPort: 443,
-      toPort: 443,
-      protocol: 'tcp',
-      sourceSecurityGroupId: this.endpointsSecurityGroup.id,
-      securityGroupId: glueSecurityGroup.id
-    });
-      
 
     // Upload job script to S3
     new S3Object(this, 'glue_job_script', {
@@ -368,8 +370,7 @@ class MyStack extends TerraformStack {
         '--job-language': 'python',
         'library-set': 'analytics', // This allows us to use AWSWrangler, Pandas etc. in the Glue job
         '--enable-job-insights': 'false',
-        '--extra-py-files': `s3://${glueScriptsBucket.id}/glue_scripts-0.1.0-py3-none-any.whl`,
-        '--python-modules-installer-option': `--no-index --no-deps --find-links s3://${glueScriptsBucket.id}/`,
+        '--extra-py-files': `s3://${glueScriptsBucket.id}/glue_scripts-0.1.0-py3-none-any.whl`
       },
       roleArn: jobRole.arn,
       timeout: 60
