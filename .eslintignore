@@ -1,0 +1,19 @@
+# ignore markdown files
+*.md
+
+# ignore node modules
+*.js
+!jest.config.js
+*.d.ts
+node_modules
+yarn.lock
+
+# CDK asset staging directory
+.cdk.staging
+cdk.out
+
+# ignore build/coverage directories
+coverage
+build
+dist
+layer

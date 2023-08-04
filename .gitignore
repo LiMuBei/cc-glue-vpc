@@ -10,3 +10,10 @@ tsconfig.tsbuildinfo
 !jest.config.js
 !setup.js
 __pycache__
+
+# yarn
+**/.yarn/*
+!.yarn/plugins
+!.yarn/releases
+yarn-error.log
+
