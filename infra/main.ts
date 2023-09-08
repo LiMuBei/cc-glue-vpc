@@ -5,7 +5,7 @@ import { App, Fn, TerraformStack } from 'cdktf';
 import { AwsProvider } from '@cdktf/provider-aws/lib/provider';
 import { Vpc } from '@cdktf/provider-aws/lib/vpc';
 import { S3Bucket } from '@cdktf/provider-aws/lib/s3-bucket';
-import { RdsCluster } from '@cdktf/provider-aws/lib/rds-cluster';
+import { RdsCluster, RdsClusterMasterUserSecretOutputReference } from '@cdktf/provider-aws/lib/rds-cluster';
 import { SecurityGroup } from '@cdktf/provider-aws/lib/security-group';
 import { SecurityGroupRule } from '@cdktf/provider-aws/lib/security-group-rule';
 import { RandomProvider } from '@cdktf/provider-random/lib/provider';
@@ -25,6 +25,9 @@ import { RouteTableAssociation } from '@cdktf/provider-aws/lib/route-table-assoc
 import { NatGateway } from '@cdktf/provider-aws/lib/nat-gateway';
 import { Eip } from '@cdktf/provider-aws/lib/eip';
 import { RdsClusterInstance } from '@cdktf/provider-aws/lib/rds-cluster-instance';
+import { SecretsmanagerSecret } from '@cdktf/provider-aws/lib/secretsmanager-secret';
+import { SecretsmanagerSecretVersion } from '@cdktf/provider-aws/lib/secretsmanager-secret-version';
+import { Password } from '@cdktf/provider-random/lib/password';
 
 class MyStack extends TerraformStack {
     constructor(scope: Construct, id: string) {
@@ -56,13 +59,26 @@ class MyStack extends TerraformStack {
         // The RDS master user password
         const rdsCluster = this.setupRds(rdsSecurityGroup, [isolatedSubnetA.id, isolatedSubnetB.id]);
 
+        const { ormSecret, jobSecret } = this.setupSecrets(
+            rdsCluster.clusterIdentifier,
+            rdsCluster.endpoint,
+            rdsCluster.databaseName
+        );
+
+        // TODO: Database setup (setup users)
+        this.setupDatabase(ormSecret);
+        // TODO: Database migration setup function
+        this.setupMigration(ormSecret);
+        // TODO: RDS reader Lambda function
+        this.setupReaderFunction(ormSecret);
+
         // Create connection for Glue jobs to access RDS
         const rdsConnection = new GlueConnection(this, 'rds-connection', {
             name: 'rds-connection',
             connectionProperties: {
                 JDBC_CONNECTION_URL: `jdbc:postgresql://${rdsCluster.endpoint}/${rdsCluster.databaseName}`,
                 JDBC_ENFORCE_SSL: 'true',
-                SECRET_ID: rdsCluster.masterUserSecret.get(0).secretArn
+                SECRET_ID: jobSecret.arn
             },
             physicalConnectionRequirements: {
                 availabilityZone: privateSubnet.availabilityZone,
@@ -72,8 +88,7 @@ class MyStack extends TerraformStack {
         });
 
         // The Glue job
-        // Note: we're using the master credentials to access the RDS DB in the job, this is not recommended for production use
-        this.createGlueJob(glueScriptsBucket, rdsCluster.masterUserSecret.get(0).secretArn, rdsConnection);
+        this.createGlueJob(glueScriptsBucket, rdsConnection, jobSecret);
     }
 
     private setupRds(rdsSecurityGroup: SecurityGroup, subnetIds: string[]) {
@@ -83,6 +98,14 @@ class MyStack extends TerraformStack {
             subnetIds: subnetIds
         });
 
+        const masterUsername = 'dbadmin';
+        const masterUserPassword = new Password(this, 'rds-master-user-password', {
+            length: 48,
+            special: false
+        });
+
+        const dbName = 'glue';
+
         // The RDS cluster
         // This is the RDS cluster where the Glue job will write to
         const rdsCluster = new RdsCluster(this, 'rds-cluster', {
@@ -90,9 +113,10 @@ class MyStack extends TerraformStack {
             engine: 'aurora-postgresql',
             engineMode: 'provisioned',
             engineVersion: '15.3',
-            databaseName: 'glue',
-            masterUsername: 'dbadmin',
-            manageMasterUserPassword: true,
+            databaseName: dbName,
+            masterUsername: masterUsername,
+            masterPassword: masterUserPassword.result,
+            manageMasterUserPassword: false,
             vpcSecurityGroupIds: [rdsSecurityGroup.id],
             dbSubnetGroupName: subnetGroup.name,
             skipFinalSnapshot: true,
@@ -109,6 +133,17 @@ class MyStack extends TerraformStack {
             engine: rdsCluster.engine,
             engineVersion: rdsCluster.engineVersion
         });
+
+        // Output the RDS master user secret
+        this.createRDSSecret(
+            'rds-master-secret',
+            'rds-master-secret',
+            masterUserPassword,
+            rdsCluster.clusterIdentifier,
+            rdsCluster.databaseName,
+            rdsCluster.endpoint,
+            'dbadmin'
+        );
 
         return rdsCluster;
     }
@@ -266,7 +301,75 @@ class MyStack extends TerraformStack {
         return { rdsSecurityGroup, glueJobsSecurityGroup };
     }
 
-    private createGlueJob(glueScriptsBucket: S3Bucket, rdsMasterUserSecretArn: string, rdsConnection: GlueConnection) {
+    private createRDSSecret(
+        resourceId: string,
+        secretName: string,
+        password: Password,
+        clusterIdentifier: string,
+        dbName: string,
+        host: string,
+        username: string
+    ) {
+        const secret = new SecretsmanagerSecret(this, `${resourceId}-secret`, {
+            name: secretName,
+            description: `RDS user secret for ${username}`
+        });
+        new SecretsmanagerSecretVersion(this, `${resourceId}-secret-version`, {
+            secretId: secret.id,
+            secretString: JSON.stringify({
+                dbClusterIdentifier: clusterIdentifier,
+                password: password.result,
+                dbname: dbName,
+                engine: 'postgres',
+                port: 5432,
+                host: host,
+                username: username
+            })
+        });
+        return secret;
+    }
+
+    private setupSecrets(clusterIdentifier: string, host: string, dbName: string) {
+        // Secret for ORM
+        const ormUsername = 'orm';
+        const ormPassword = new Password(this, 'orm-password', {
+            length: 48,
+            special: false
+        });
+        const ormSecret = this.createRDSSecret(
+            'orm-secret',
+            'orm-secret',
+            ormPassword,
+            clusterIdentifier,
+            dbName,
+            host,
+            ormUsername
+        );
+
+        // Secret for Glue job
+        const jobUsername = 'glue';
+        const jobPassword = new Password(this, 'job-password', {
+            length: 48,
+            special: false
+        });
+        const jobSecret = this.createRDSSecret(
+            'job-secret',
+            'job-secret',
+            jobPassword,
+            clusterIdentifier,
+            dbName,
+            host,
+            jobUsername
+        );
+
+        return { ormSecret, jobSecret };
+    }
+
+    private createGlueJob(
+        glueScriptsBucket: S3Bucket,
+        rdsConnection: GlueConnection,
+        rdsUserSecret: SecretsmanagerSecret
+    ) {
         const jobPolicyDocument = new DataAwsIamPolicyDocument(this, 'glue-job-policy-document', {
             version: '2012-10-17',
             statement: [
@@ -280,7 +383,7 @@ class MyStack extends TerraformStack {
                     sid: 'GlueJobAllowRdsSecretAccess',
                     effect: 'Allow',
                     actions: ['secretsmanager:GetSecretValue'],
-                    resources: [rdsMasterUserSecretArn]
+                    resources: [rdsUserSecret.arn]
                 }
             ]
         });
@@ -311,16 +414,16 @@ class MyStack extends TerraformStack {
         new S3Object(this, 'glue_job_script', {
             bucket: glueScriptsBucket.id,
             key: 'generate_data_to_rds.py',
-            source: `${__dirname}/glue_scripts/jobs/generate_data_to_rds.py`,
-            sourceHash: Fn.filemd5(`${__dirname}/glue_scripts/jobs/generate_data_to_rds.py`)
+            source: `${__dirname}/../glue_scripts/jobs/generate_data_to_rds.py`,
+            sourceHash: Fn.filemd5(`${__dirname}/../glue_scripts/jobs/generate_data_to_rds.py`)
         });
 
         // Upload job Python package to S3
         new S3Object(this, 'glue_job_lib', {
             bucket: glueScriptsBucket.id,
             key: 'glue_scripts-0.1.0-py3-none-any.whl',
-            source: `${__dirname}/glue_scripts/dist/glue_scripts-0.1.0-py3-none-any.whl`,
-            sourceHash: Fn.filemd5(`${__dirname}/glue_scripts/dist/glue_scripts-0.1.0-py3-none-any.whl`)
+            source: `${__dirname}/../glue_scripts/dist/glue_scripts-0.1.0-py3-none-any.whl`,
+            sourceHash: Fn.filemd5(`${__dirname}/../glue_scripts/dist/glue_scripts-0.1.0-py3-none-any.whl`)
         });
 
         new GlueJob(this, 'glue-job', {
@@ -339,7 +442,10 @@ class MyStack extends TerraformStack {
                 '--job-language': 'python',
                 'library-set': 'analytics', // This allows us to use AWSWrangler, Pandas etc. in the Glue job
                 '--enable-job-insights': 'false',
-                '--extra-py-files': `s3://${glueScriptsBucket.id}/glue_scripts-0.1.0-py3-none-any.whl`
+                '--extra-py-files': `s3://${glueScriptsBucket.id}/glue_scripts-0.1.0-py3-none-any.whl`,
+                '--db_secret': rdsUserSecret.name,
+                '--target_schema': 'public',
+                '--target_table': 'data'
             },
             roleArn: jobRole.arn,
             timeout: 60
